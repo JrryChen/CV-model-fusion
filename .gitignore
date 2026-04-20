@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.onnx
+runs/
+logs/
+logs_*/
+
+# Evaluation outputs (regenerable)
+eval_results/
+
+# SLURM job logs
+*.out
+*.err
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.venv*/
+venv*/
+envs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# LaTeX build artifacts
+report/*.aux
+report/*.log
+report/*.bbl
+report/*.blg
+report/*.out
+report/*.toc
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz
+report/report.pdf
+
+# Inference outputs
+*.jsonl

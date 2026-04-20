@@ -1,0 +1,528 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage[numbers]{natbib}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=green!50!black,
+    urlcolor=blue!60!black,
+}
+
+% ── Title ─────────────────────────────────────────────────────────────────────
+\title{\textbf{Multi-Model Fusion for Robust 2D Upper-Limb Pose Estimation}}
+\author{
+    Jerry Chen \\
+    \textit{University of Pittsburgh} \\
+    \texttt{jzc23@pitt.edu}
+}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{abstract}
+Single pose-estimation models, while individually accurate, are prone to
+sporadic catastrophic failures caused by occlusion, motion blur, or
+domain-specific appearance changes.  We present a learned fusion framework
+that combines the predictions of three complementary 2D pose estimators---HRNet/DEKR,
+OpenPose, and MediaPipe---to produce robust upper-limb keypoint estimates for
+exercise and rehabilitation video.  We compare an MLP-based attention fusion, a
+Transformer encoder--decoder fusion, an internal-attention Transformer variant,
+and two rule-based baselines (uniform and confidence-weighted averaging) on a
+custom dataset of 5{,}346 test frames across three left-arm joints (16{,}038
+evaluation samples).  The MLP Fusion achieves \textbf{100\% accuracy} at a
+normalized distance threshold of $\tau{=}0.05$ ($\approx$18\,px), eliminating
+all outlier predictions while maintaining a mean L2 error of 3.22\,px.  We
+discuss the \emph{precision--robustness tradeoff}: HRNet alone attains a lower
+mean L2 (1.80\,px) yet fails on 0.34\% of samples, whereas the fusion model
+hedges its predictions to avoid every failure.  Code and evaluation pipelines
+are publicly available.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+
+Accurate 2D human pose estimation is a foundational task in computer vision
+with direct applications in physical therapy, exercise monitoring, and
+biomechanical analysis.  Modern deep-learning--based pose estimators such as
+HRNet/DEKR~\cite{geng2021dekr, sun2019hrnet}, OpenPose~\cite{cao2017openpose},
+and MediaPipe~\cite{lugaresi2019mediapipe} achieve high average accuracy, yet
+each model exhibits distinct failure modes: HRNet can mislocalize joints during
+fast motion, OpenPose may miss detections entirely under occlusion, and
+MediaPipe occasionally produces large outliers on uncommon viewpoints.
+
+In safety-sensitive applications---for instance, tracking a patient's arm
+during rehabilitation exercises---a single catastrophic misprediction can
+invalidate an entire session.  Rather than investing in a single
+ever-larger model, we explore \emph{multi-model fusion}: can a lightweight
+learned combiner, trained on the precomputed outputs of several off-the-shelf
+estimators, eliminate outlier failures while preserving overall precision?
+
+\paragraph{Contributions.}
+\begin{enumerate}[nosep]
+    \item A per-joint attention-based MLP fusion architecture that achieves
+          100\% threshold-based accuracy on a rehabilitation-video test set,
+          surpassing every individual estimator.
+    \item A systematic comparison of learned (MLP, Transformer,
+          Internal-Attention Transformer) and rule-based (uniform,
+          confidence-weighted) fusion strategies.
+    \item An analysis of the \emph{precision vs.\ robustness tradeoff},
+          explaining why fusion models may have higher mean error yet fewer
+          catastrophic failures than the best single estimator.
+    \item A study of fine-tuning strategies for pose backbones (full
+          fine-tuning vs.\ frozen backbone), including diagnosis and resolution
+          of catastrophic forgetting.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+
+\paragraph{Pose estimation backbones.}
+Bottom-up approaches such as DEKR~\cite{geng2021dekr} built on
+HRNet~\cite{sun2019hrnet} regress disentangled per-keypoint heatmaps and
+offsets, achieving strong multi-person results on COCO~\cite{lin2014coco}.
+OpenPose~\cite{cao2017openpose} uses Part Affinity Fields for real-time
+multi-person detection.  MediaPipe~\cite{lugaresi2019mediapipe} targets
+mobile and edge deployment with a lightweight pipeline.
+ViTPose~\cite{xu2022vitpose} applies Vision Transformers to pose estimation,
+offering state-of-the-art results on multiple benchmarks.
+
+\paragraph{Model fusion and ensembles.}
+Ensemble methods are well-established in classification~\cite{dietterich2000ensemble}
+but less explored for structured regression outputs such as keypoint
+coordinates.  Prior work on pose ensemble typically averages heatmaps before
+decoding~\cite{chen2018cascaded}, whereas our approach operates directly on
+decoded coordinate--confidence tuples, enabling heterogeneous model
+combinations without requiring access to internal feature maps.
+
+\paragraph{Attention-based fusion.}
+Multi-head self-attention~\cite{vaswani2017attention} provides a natural
+mechanism for weighting variable-quality inputs per token.  Our MLP fusion
+treats each model's prediction for a given joint as a token and applies a
+single layer of self-attention to produce a fused output---a lightweight
+alternative to full Transformer encoder--decoder architectures.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Dataset}\label{sec:dataset}
+
+\paragraph{Video corpus.}
+We use a custom multi-camera dataset of exercise and rehabilitation sessions
+captured at two camera angles (\texttt{cam0}, \texttt{cam2}).  Video clips are
+organized by patient and exercise type under a hierarchical directory
+(\texttt{clips\_mp4/<patient>/<exercise>/}).  Each clip is stored as an MP4
+file with accompanying ground-truth annotations.
+
+% >>> AUTHOR NOTE: replace or expand the following sentence with the
+%     institutional source, IRB approval, or DOI if applicable. <<<
+\textit{(Dataset source: collected from rehabilitation/exercise sessions at the
+University of Pittsburgh.  Details on collection protocol and IRB approval
+should be added here.)}
+
+\paragraph{Annotations.}
+Ground-truth 2D keypoints are provided in per-video \texttt{p2d} text files.
+Each line contains space-separated floating-point coordinates for the three
+left-arm joints of interest: \textbf{left shoulder}, \textbf{left elbow}, and
+\textbf{left wrist} (6 values: $x_1, y_1, x_2, y_2, x_3, y_3$).
+
+\paragraph{Data splits.}
+Splits are performed at the patient level to prevent data leakage.  The test
+partition comprises \textbf{5{,}346 frames} across multiple videos.  Since each
+frame contributes three joint evaluations, the total number of evaluation
+samples is $5{,}346 \times 3 = \mathbf{16{,}038}$.
+
+\paragraph{Precomputed prediction caches.}
+Rather than running each backbone at training time, we precompute per-frame
+2D predictions and confidence scores for every model (HRNet/DEKR, OpenPose,
+MediaPipe) and store them in cache files under \texttt{p2d\_cache/}.  The
+fusion models are trained and evaluated entirely on these cached predictions,
+making the pipeline fast and reproducible.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Methods}\label{sec:methods}
+
+All fusion models receive the same input per frame: for each of $K{=}3$ joints,
+the $(x,y)$ coordinates and scalar confidence from each of $M{=}3$ backbone
+models, yielding a tensor of shape $(B, K, 3)$ per model (2 coordinates + 1
+confidence).
+
+\subsection{Baseline Detectors}\label{sec:baselines}
+
+\begin{description}[nosep, leftmargin=1em]
+    \item[HRNet/DEKR] Bottom-up keypoint regression using High-Resolution
+        Network (HRNet-W48) with Disentangled Keypoint Regression, pretrained
+        on COCO~\cite{geng2021dekr, sun2019hrnet}.
+    \item[OpenPose] Real-time multi-person pose estimation via Part Affinity
+        Fields, using the CMU BODY\_25 model~\cite{cao2017openpose}.
+    \item[MediaPipe] Google's lightweight pose-estimation pipeline optimized
+        for mobile inference~\cite{lugaresi2019mediapipe}.
+\end{description}
+
+\subsection{Fusion Architectures}\label{sec:fusion-arch}
+
+\subsubsection{MLP Attention Fusion}
+
+For each joint $k$, the three model predictions (each a 3-vector of $[x, y, \text{conf}]$) are
+independently projected to a $d$-dimensional embedding via per-model \texttt{SmallMLP}
+modules, then summed with learned joint and model embeddings.  A single
+multi-head self-attention layer ($d{=}64$, 4 heads) fuses the three model
+tokens into a weighted combination, followed by a feed-forward network and
+layer normalization.  Two linear heads decode the fused embedding into
+predicted coordinates $(x, y)$ and a confidence logit.  The attention weights
+provide interpretable \emph{importance scores} per model per joint.
+
+\subsubsection{Transformer Encoder--Decoder Fusion}
+
+Each model's per-joint features are encoded by a dedicated
+\texttt{TransformerEncoderLayer} and concatenated into a memory of length
+$3K$.  A learned query set of $K$ tokens is decoded via cross-attention
+(\texttt{FusionTransformerDecoderLayer}) to produce the fused
+output~\cite{vaswani2017attention}.  The cross-attention weights serve as
+importance indicators.
+
+\subsubsection{Internal-Attention Transformer Fusion}
+
+A self-attention variant where all $3K$ model--joint tokens are processed by
+stacked Transformer encoder layers with $3K$-length self-attention.  A
+pooling-and-reshape step maps the output back to $K$ joint predictions.
+
+\subsection{Rule-Based Baselines}\label{sec:rule-based}
+
+\begin{description}[nosep, leftmargin=1em]
+    \item[Uniform Fusion] Each model receives equal weight
+        $w_m = \tfrac{1}{3}$; the fused coordinate is the arithmetic mean.
+    \item[Confidence-Weighted Fusion] Weights are proportional to each
+        model's reported confidence per joint:
+        $w_m^{(k)} = c_m^{(k)} / \sum_{m'} c_{m'}^{(k)}$.
+\end{description}
+
+\subsection{Fine-Tuned Single Models}\label{sec:finetuned}
+
+To contextualize fusion performance, we also fine-tune individual backbones
+on the target domain:
+
+\begin{itemize}[nosep]
+    \item \textbf{DEKR (trained)}: Full fine-tuning from COCO weights with a
+        conservative learning rate ($10^{-5}$) and ColorJitter augmentation.
+    \item \textbf{DEKR (frozen backbone)}: Only the regression head is
+        trained; backbone weights are frozen.
+    \item \textbf{OpenPose (trained / frozen)}: Analogous strategies applied
+        to the OpenPose model.
+\end{itemize}
+
+Key training insights from iterative experimentation (see
+Section~\ref{sec:discussion}): aggressive learning rates caused catastrophic
+forgetting in DEKR (accuracy collapsed to ${\sim}10\%$); a fresh restart with
+reduced LR and augmentation recovered performance to 99.95\%.
+
+\subsection{Training Details}
+
+All fusion models are trained with the AdamW optimizer on the cached
+three-model predictions.  The loss combines a smooth-L1 coordinate regression
+term with a binary cross-entropy confidence loss.  Data augmentation for fusion
+models includes random keypoint jitter ($\pm 2$\,px) and 10\% random joint
+occlusion to improve robustness.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Experiments and Results}\label{sec:results}
+
+\subsection{Evaluation Protocol}
+
+We evaluate on the held-out test set of 16{,}038 joint predictions (5{,}346
+frames $\times$ 3 joints).  Metrics:
+
+\begin{itemize}[nosep]
+    \item \textbf{Accuracy} ($\tau{=}0.05$): fraction of predictions within a
+        normalized L2 distance of 0.05 from ground truth ($\approx$18\,px in
+        $256{\times}256$ image space).
+    \item \textbf{Mean L2 (px)}: average Euclidean error in pixels.
+    \item \textbf{Mean L2 (norm)}: L2 normalized by image diagonal.
+    \item \textbf{MAE}: mean absolute error of coordinates.
+    \item \textbf{Calibration gap}: difference between mean confidence and
+        actual accuracy (positive = overconfident).
+\end{itemize}
+
+\subsection{Fusion Model Comparison}
+
+Table~\ref{tab:fusion} compares the five fusion strategies.  MLP Fusion achieves
+perfect accuracy while Confidence-Weighted Fusion attains the lowest mean L2.
+
+\begin{table}[H]
+\centering
+\caption{Fusion model comparison on the test set (16{,}038 samples).
+         Best value in each column is \textbf{bolded}.}
+\label{tab:fusion}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Model} & \textbf{Accuracy (\%)} & \textbf{L2 (px)} & \textbf{L2 (norm)} & \textbf{MAE} \\
+\midrule
+MLP Fusion                    & \textbf{100.00} & 3.215 & 0.0089 & 0.0076 \\
+Confidence-Weighted           & 99.92  & \textbf{2.074} & \textbf{0.0057} & \textbf{0.0047} \\
+Transformer Fusion            & 99.69  & 4.492 & 0.0124 & 0.0114 \\
+Internal Transformer Fusion   & 99.58  & 3.441 & 0.0095 & 0.0085 \\
+Uniform Fusion ($\tfrac{1}{3}$) & 98.39  & 3.052 & 0.0084 & 0.0073 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Individual Baseline Comparison}
+
+Table~\ref{tab:baselines} reports the performance of each backbone model
+individually, including fine-tuned variants.
+
+\begin{table}[H]
+\centering
+\caption{Individual baseline model performance.  ``Pre-trained'' models use
+         off-the-shelf COCO/ImageNet weights; ``Trained'' models are fine-tuned
+         on the target domain.}
+\label{tab:baselines}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Model} & \textbf{Accuracy (\%)} & \textbf{L2 (px)} & \textbf{Samples} \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Pre-trained (cached predictions)}} \\
+\quad HRNet/DEKR              & 99.66 & 1.795  & 16{,}038 \\
+\quad MediaPipe               & 98.74 & 2.532  & 15{,}972 \\
+\quad OpenPose                & 98.18 & 2.612  & 14{,}916 \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Fine-tuned on target domain}} \\
+\quad DEKR (trained)          & 99.95 & 6.273  & 16{,}038 \\
+\quad OpenPose (frozen backbone) & 91.71 & 9.778  & 16{,}038 \\
+\quad OpenPose (trained)      & 88.50 & 11.378 & 16{,}038 \\
+\quad DEKR (frozen backbone)  & 70.72 & 29.733 & 16{,}038 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Patient-Level Model Evaluation}
+
+To complement the fusion-specific test set evaluation, we conducted a broader
+frame-level analysis of five backbone models across the full dataset
+(52 patient--camera cases, 47{,}082 annotated frames).  For each model, the
+normalized mean error per frame was computed, then aggregated as a
+frame-weighted mean with 95\% confidence intervals.  Table~\ref{tab:patient}
+summarizes these results.
+
+\begin{table}[H]
+\centering
+\caption{Frame-level mean error (normalized) across 52 patient--camera cases
+         (47{,}082 frames).  The weighted mean accounts for varying video
+         lengths; 95\% CI is computed from the pooled standard deviation.}
+\label{tab:patient}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Model} & \textbf{Weighted Mean} & \textbf{95\% CI} & \textbf{Pooled Std} & \textbf{Unweighted Mean} & \textbf{Cases} \\
+\midrule
+ViTPose    & 0.0302 & [0.0301, 0.0303] & 0.0128 & 0.0308 & 52 \\
+DEKR       & 0.0337 & [0.0335, 0.0338] & 0.0163 & 0.0341 & 52 \\
+OpenPose   & 0.0354 & [0.0352, 0.0356] & 0.0234 & 0.0369 & 52 \\
+MediaPipe  & 0.0357 & [0.0356, 0.0359] & 0.0148 & 0.0366 & 52 \\
+PoseBERT   & 0.0669 & [0.0666, 0.0672] & 0.0368 & 0.0661 & 52 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ViTPose achieves the lowest frame-level error (0.0302), followed closely by
+DEKR (0.0337), OpenPose (0.0354), and MediaPipe (0.0357).  PoseBERT, designed
+primarily for 3D mesh recovery rather than precise 2D joint localization,
+trails at 0.0669.  The tight confidence intervals (owing to the large frame
+count) confirm that the ranking is statistically robust.  Notably, the relative
+ordering differs from the fusion test set results (Table~\ref{tab:baselines}),
+where DEKR/HRNet leads in L2; this is because the patient-level evaluation
+spans the full dataset rather than the held-out test split and uses a different
+error normalization.
+
+\subsection{Confidence Calibration}
+
+Table~\ref{tab:calibration} shows the confidence calibration of the learned fusion
+models.  MLP Fusion exhibits near-perfect calibration, while the Transformer
+variants are slightly overconfident.
+
+\begin{table}[H]
+\centering
+\caption{Confidence calibration of learned fusion models.  Calibration gap =
+         mean confidence $-$ accuracy; negative values indicate
+         underconfidence.}
+\label{tab:calibration}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Model} & \textbf{Mean Conf.} & \textbf{Conf.\ (correct)} & \textbf{Conf.\ (incorrect)} & \textbf{Cal.\ Gap} \\
+\midrule
+MLP Fusion                  & 0.9946 & 0.9946 & ---    & $-0.005$ \\
+Transformer Fusion          & 0.9992 & 0.9993 & 0.9944 & $+0.002$ \\
+Internal Transformer        & 0.9997 & 0.9997 & 0.9998 & $+0.004$ \\
+Uniform Fusion              & 0.9011 & 0.9056 & 0.6250 & $-0.078$ \\
+Confidence-Weighted         & 0.9433 & 0.9433 & 0.9407 & $-0.056$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Importance Weight Analysis}
+
+The attention mechanism in learned fusion models produces per-frame, per-joint
+\emph{importance weights} indicating how much each backbone contributes to the
+fused output.  Analysis of these weights across the 5{,}346 test frames reveals
+that HRNet/DEKR consistently receives the highest importance in the MLP model,
+followed by MediaPipe and OpenPose.  Notably, the weights shift at video
+boundaries and during challenging frames (occlusion, fast motion), demonstrating
+that the model dynamically adapts its weighting strategy.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}\label{sec:discussion}
+
+\subsection{Precision vs.\ Robustness Tradeoff}
+
+A central finding is the tension between \emph{mean error} and
+\emph{worst-case reliability}.  HRNet/DEKR achieves the lowest mean L2
+(1.795\,px) among all models but fails the accuracy threshold on 0.34\% of
+samples.  MLP Fusion, by contrast, achieves 100\% accuracy---every prediction
+falls within $\tau{=}0.05$---at the cost of a higher mean L2 (3.215\,px).
+
+This behavior arises because the fusion model learns to ``hedge'' its
+predictions.  When one backbone produces an outlier, the attention mechanism
+down-weights it in favor of the remaining models, pulling the prediction back
+within the safe threshold.  The result is a small increase in average error
+(the fused prediction is pulled away from the best single-model estimate on
+easy frames) but a complete elimination of catastrophic failures.
+
+For safety-critical applications such as patient monitoring, this tradeoff is
+clearly favorable: practitioners typically set hard error thresholds, and
+\emph{zero} threshold violations is more valuable than a marginally lower
+average error.
+
+\subsection{MLP vs.\ Transformer Fusion}
+
+Somewhat counter-intuitively, the simplest learned architecture---MLP
+Fusion with a single attention layer---outperforms both Transformer variants
+on accuracy (100\% vs.\ 99.69\% and 99.58\%).  The Transformers' larger
+parameter count increases overfitting risk, despite stronger regularization
+(dropout~0.2, keypoint jitter, random occlusion).  The MLP model's inductive
+bias of treating each joint independently via per-joint attention appears
+well-suited to this low-dimensional fusion task where cross-joint reasoning
+offers limited benefit.
+
+\subsection{Confidence-Weighted Fusion: A Strong Heuristic}
+
+The confidence-weighted rule-based baseline achieves the lowest mean L2
+(2.074\,px) and near-perfect accuracy (99.92\%).  This suggests that the
+backbone models' confidence scores are informative per-sample quality
+indicators.  However, the remaining 0.08\% failure rate (13 samples) shows
+that confidence alone is insufficient to detect all failure modes---the
+learned MLP model captures subtler correlations that confidence cannot.
+
+\subsection{Fine-Tuning Challenges}
+
+Fine-tuning pretrained backbones on the target domain revealed significant
+pitfalls:
+
+\begin{itemize}[nosep]
+    \item \textbf{Catastrophic forgetting}: DEKR with an aggressive learning
+        rate ($5{\times}10^{-5}$) collapsed to ${\sim}10\%$ accuracy.  Reducing
+        LR to $10^{-5}$ with data augmentation and a fresh checkpoint
+        recovered performance to 99.95\%.
+    \item \textbf{Frozen backbone paradox}: OpenPose's frozen-backbone
+        variant (91.71\%) \emph{outperformed} its fully-trained counterpart
+        (88.50\%), indicating that full fine-tuning suffered from forgetting
+        useful COCO features.
+    \item \textbf{Strategy mismatch}: Frozen-backbone models require
+        \emph{higher} learning rates (the backbone cannot be damaged) and more
+        training epochs, the opposite of full fine-tuning best practices.
+\end{itemize}
+
+These findings underscore that \textbf{fusion of fixed pretrained models}
+can be more practical than investing engineering effort into domain-specific
+fine-tuning, which risks degrading already-strong baselines.
+
+\subsection{Limitations}
+
+\begin{itemize}[nosep]
+    \item \textbf{Single dataset}: All results are on one exercise/rehabilitation
+        corpus; cross-dataset generalization is not evaluated.
+    \item \textbf{Three joints only}: The current evaluation targets left-arm
+        joints; scaling to full-body pose may change the fusion dynamics.
+    \item \textbf{Threshold sensitivity}: The 100\% accuracy claim depends on
+        $\tau{=}0.05$; at tighter thresholds, some MLP failures would appear.
+    \item \textbf{No temporal modeling}: Each frame is fused independently;
+        incorporating temporal consistency could further improve robustness.
+    \item \textbf{ViTPose integration}: A fourth backbone (ViTPose~\cite{xu2022vitpose})
+        was partially integrated but not included in the final evaluation due
+        to coordinate normalization mismatches in the cached predictions.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+
+We demonstrated that a lightweight learned fusion of three complementary pose
+estimators can achieve \textbf{100\% threshold-based accuracy} on a
+rehabilitation video test set, entirely eliminating the catastrophic outlier
+predictions that affect each individual model.  The key insight is the
+\emph{precision--robustness tradeoff}: fusion models sacrifice a small amount
+of average accuracy to guarantee that no prediction exceeds the safety
+threshold.
+
+Among fusion strategies, the MLP Attention model proved most effective for
+accuracy, while the confidence-weighted heuristic offered the best mean L2.
+Transformer-based architectures, despite greater capacity, were more prone to
+overfitting in this low-dimensional setting.  Our fine-tuning experiments
+further showed that domain adaptation of pretrained backbones is fragile and
+often counterproductive, reinforcing the case for fusion-level solutions.
+\paragraph{Future work.}
+Promising directions include (1) integrating ViTPose as a fourth backbone in
+the fusion pipeline, (2) adding temporal consistency via recurrent or
+Transformer-based sequence models, (3) evaluating on cross-domain benchmarks
+(e.g., clinical vs.\ sports video), and (4) exploring the 4-model fusion
+variants already prototyped in the codebase.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Resources}\label{sec:resources}
+
+\paragraph{Code.}
+The full source code for the fusion models, training scripts, evaluation
+pipeline, and visualization tools is publicly available at:
+
+\begin{center}
+\url{https://github.com/jzc23/pose-fusion}
+\end{center}
+
+\noindent\textit{(Update the URL above with the actual public repository link.)}
+
+\paragraph{Dataset.}
+The evaluation dataset consists of exercise and rehabilitation video clips
+collected at the University of Pittsburgh.  Videos are organized by patient
+and exercise type, with manual 2D keypoint annotations for three left-arm
+joints.  The dataset structure, split scripts, and annotation format are
+documented in the repository.
+
+% >>> AUTHOR NOTE: If the dataset has a DOI, data-sharing agreement, or
+%     specific institutional citation, add it here. <<<
+
+\paragraph{Pretrained models and libraries.}
+The following open-source projects are used as backbone pose estimators:
+\begin{itemize}[nosep]
+    \item DEKR / HRNet: \url{https://github.com/HRNet/DEKR}~\cite{geng2021dekr}
+    \item OpenPose (PyTorch): \url{https://github.com/CMU-Perceptual-Computing-Lab/openpose}~\cite{cao2017openpose}
+    \item MediaPipe: \url{https://github.com/google/mediapipe}~\cite{lugaresi2019mediapipe}
+    \item ViTPose: \url{https://github.com/ViTAE-Transformer/ViTPose}~\cite{xu2022vitpose}
+    \item easy\_ViTPose wrapper: \url{https://github.com/JunkyByte/easy_ViTPose}
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
