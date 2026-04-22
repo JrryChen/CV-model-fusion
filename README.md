@@ -21,7 +21,32 @@ models.
 | Internal Transformer | 99.58% | 3.441 |
 | Uniform (1/3) | 98.39% | 3.052 |
 
-Evaluated on 16,038 samples (5,346 frames x 3 joints).
+Evaluated on 16,038 samples (5,346 frames x 3 joints). All results above are
+from the 3-model fusion variants (HRNet/DEKR + OpenPose + MediaPipe). The
+4-model fusion variants (which add ViTPose) have not been evaluated yet.
+
+### Baseline Models
+
+| Model | Accuracy | Mean L2 (px) | Mean L2 (norm) | Samples |
+|---|---|---|---|---|
+| HRNet/DEKR | 99.66% | 1.795 | 0.0050 | 16,038 |
+| MediaPipe | 98.74% | 2.532 | 0.0070 | 15,972 |
+| OpenPose | 98.18% | 2.612 | 0.0072 | 14,916 |
+| DEKR (Trained) | 99.95% | 6.273 | 0.0173 | 16,038 |
+| OpenPose (Frozen BN) | 91.71% | 9.778 | 0.0270 | 16,038 |
+| OpenPose (Trained) | 88.50% | 11.378 | 0.0314 | 16,038 |
+| DEKR (Frozen Backbone) | 70.72% | 29.733 | 0.0821 | 16,038 |
+
+### MLP Fusion Improvement vs Baselines
+
+| Baseline | Accuracy Δ | Per-Frame Error Δ |
+|---|---|---|
+| vs HRNet/DEKR | +0.34 pp | -79.1% (better) |
+| vs OpenPose | +1.82 pp | -23.2% (better) |
+| vs MediaPipe | +1.26 pp | -27.0% (better) |
+| vs DEKR (Trained) | +89.38 pp | +95.3% (worse) |
+| vs DEKR (Frozen) | +100.00 pp | +95.7% (worse) |
+| vs OpenPose (Trained) | +11.50 pp | +71.7% (worse) |
 
 ## Repository Structure
 
@@ -47,9 +72,6 @@ pose-fusion/
 ├── evaluate_fusion.py                 # Unified evaluation pipeline
 ├── run_inference.py                   # Run inference and export predictions
 ├── plot_importance_comparison.py      # Importance weight comparison plots
-├── report/
-│   ├── report.tex                     # Full project report (LaTeX)
-│   └── references.bib
 ├── requirements.txt
 └── LICENSE
 ```
@@ -170,18 +192,6 @@ repositories:
 ```bash
 export DEKR_ROOT=/path/to/DEKR
 export OPENPOSE_ROOT=/path/to/pytorch-openpose
-```
-
-## Report
-
-The full project report (LaTeX) is in `report/report.tex`. To compile:
-
-```bash
-cd report
-pdflatex report
-bibtex report
-pdflatex report
-pdflatex report
 ```
 
 ## Author
