@@ -15,7 +15,7 @@ models.
 
 | Fusion Model | Accuracy | Mean L2 (px) |
 |---|---|---|
-| **MLP Fusion** | **100.00%** | 3.215 |
+| **MLP Fusion** | **100.00%** | **3.215** |
 | Confidence-Weighted | 99.92% | 2.074 |
 | Transformer Fusion | 99.69% | 4.492 |
 | Internal Transformer | 99.58% | 3.441 |
